@@ -1,110 +1,82 @@
-## main.py文件
-import argparse
-from tqdm import tqdm
 import torch
-import torchvision
-import torch.nn as nn
-import torch.nn.functional as F
-# 新增：
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+import argparse
+from torch import distributed as dist
+
+print(torch.cuda.device_count())  # 打印gpu数量
+torch.distributed.init_process_group(backend="nccl")  # 并行训练初始化，建议'nccl'模式
+print('world_size', torch.distributed.get_world_size()) # 打印当前进程数
+
+# 下面这个参数需要加上，torch内部调用多进程时，会使用该参数，对每个gpu进程而言，其local_rank都是不同的；
+parser.add_argument('--local_rank', default=-1, type=int)  
+args = parser.parse_args()
+torch.cuda.set_device(args.local_rank)  # 设置gpu编号为local_rank;此句也可能看出local_rank的值是什么
+
+def reduce_mean(tensor, nprocs):  # 用于平均所有gpu上的运行结果，比如loss
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= nprocs
+    return rt
 
 
-### 1. 基础模块 ###
-# 假设我们的模型是这个，与DDP无关
-class ToyModel(nn.Module):
-    def __init__(self):
-        super(ToyModel, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+'''
+多卡训练加载数据:
+# Dataset的设计上与单gpu一致，但是DataLoader上不一样。首先解释下原因：多gpu训练是，我们希望
+# 同一时刻在每个gpu上的数据是不一样的，这样相当于batch size扩大了N倍，因此起到了加速训练的作用。
+# 在DataLoader时，如何做到每个gpu上的数据是不一样的，且gpu1上训练过的数据如何确保接下来不被别
+# 的gou再次训练。这时候就得需要DistributedSampler。
+# dataloader设置方式如下，注意shuffle与sampler是冲突的，并行训练需要设置sampler，此时务必
+# 要把shuffle设为False。但是这里shuffle=False并不意味着数据就不会乱序了，而是乱序的方式交给
+# sampler来控制，实质上数据仍是乱序的。
+'''
+train_sampler = torch.utils.data.distributed.DistributedSampler(My_Dataset)
+dataloader = torch.utils.data.DataLoader(ds,
+                                         batch_size=batch_size,
+                                         shuffle=False,
+                                         num_workers=16,
+                                         pin_memory=True,
+                                         drop_last=True,
+                                         sampler=self.train_sampler)
 
 
-# 假设我们的数据是这个
-def get_dataset():
-    transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-    my_trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                               download=True, transform=transform)
-    # DDP：使用DistributedSampler，DDP帮我们把细节都封装起来了。
-    #      用，就完事儿！sampler的原理，第二篇中有介绍。
-    train_sampler = torch.utils.data.distributed.DistributedSampler(my_trainset)
-    # DDP：需要注意的是，这里的batch_size指的是每个进程下的batch_size。
-    #      也就是说，总batch_size是这里的batch_size再乘以并行数(world_size)。
-    trainloader = torch.utils.data.DataLoader(my_trainset,
-                                              batch_size=16, num_workers=2, sampler=train_sampler)
-    return trainloader
 
+'''
+多卡训练的模型设置：
+# 最主要的是find_unused_parameters和broadcast_buffers参数；
+# find_unused_parameters：如果模型的输出有不需要进行反传的(比如部分参数被冻结/或者网络前传是动态的)，设置此参数为True;如果你的代码运行
+# 后卡住某个地方不动，基本上就是该参数的问题。
+# broadcast_buffers：设置为True时，在模型执行forward之前，gpu0会把buffer中的参数值全部覆盖
+# 到别的gpu上。注意这和同步BN并不一样，同步BN应该使用SyncBatchNorm。
+'''
+My_model = My_model.cuda(args.local_rank)  # 将模型拷贝到每个gpu上.直接.cuda()也行，因为多进程时每个进程的device号是不一样的
+My_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(My_model) # 设置多个gpu的BN同步
+My_model = torch.nn.parallel.DistributedDataParallel(My_model, 
+                                                     device_ids=[args.local_rank], 
+                                                     output_device=args.local_rank, 
+                                                     find_unused_parameters=False, 
+                                                     broadcast_buffers=False)
 
-### 2. 初始化我们的模型、数据、各种配置  ####
-# DDP：从外部得到local_rank参数
-parser = argparse.ArgumentParser()
-parser.add_argument("--local_rank", default=-1, type=int)
-FLAGS = parser.parse_args()
-local_rank = FLAGS.local_rank
-
-# DDP：DDP backend初始化
-torch.cuda.set_device(local_rank)
-dist.init_process_group(backend='nccl')  # nccl是GPU设备上最快、最推荐的后端
-
-# 准备数据，要在DDP初始化之后进行
-trainloader = get_dataset()
-
-# 构造模型
-model = ToyModel().to(local_rank)
-# DDP: Load模型要在构造DDP模型之前，且只需要在master上加载就行了。
-ckpt_path = None
-if dist.get_rank() == 0 and ckpt_path is not None:
-    model.load_state_dict(torch.load(ckpt_path))
-# DDP: 构造DDP model
-model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-# DDP: 要在构造DDP model之后，才能用model初始化optimizer。
-optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
-
-# 假设我们的loss是这个
-loss_func = nn.CrossEntropyLoss().to(local_rank)
-
-### 3. 网络训练  ###
-model.train()
-iterator = tqdm(range(100))
-for epoch in iterator:
-    # DDP：设置sampler的epoch，
-    # DistributedSampler需要这个来指定shuffle方式，
-    # 通过维持各个进程之间的相同随机数种子使不同进程能获得同样的shuffle效果。
-    trainloader.sampler.set_epoch(epoch)
-    # 后面这部分，则与原来完全一致了。
-    for data, label in trainloader:
-        data, label = data.to(local_rank), label.to(local_rank)
-        optimizer.zero_grad()
-        prediction = model(data)
-        loss = loss_func(prediction, label)
+'''开始多卡训练：'''
+for epoch in range(200):
+    train_sampler.set_epoch(epoch)  # 这句莫忘，否则相当于没有shuffle数据
+    My_model.train()
+    for idx, sample in enumerate(dataloader):
+        inputs, targets = sample[0].cuda(local_rank, non_blocking=True), sample[1].cuda(local_rank, non_blocking=True)
+        opt.zero_grad()
+        output = My_model(inputs)
+        loss = My_loss(output, targets)  # 
         loss.backward()
-        iterator.desc = "loss = %0.3f" % loss
-        optimizer.step()
-    # DDP:
-    # 1. save模型的时候，和DP模式一样，有一个需要注意的点：保存的是model.module而不是model。
-    #    因为model其实是DDP model，参数是被`model=DDP(model)`包起来的。
-    # 2. 只需要在进程0上保存一次就行了，避免多次保存重复的东西。
-    if dist.get_rank() == 0:
-        torch.save(model.module.state_dict(), "%d.ckpt" % epoch)
+        opt.step()
+        loss = reduce_mean(loss, dist.get_world_size())  # 多gpu的loss进行平均。
 
-################
-## Bash运行
-# DDP: 使用torch.distributed.launch启动DDP模式
-# 使用CUDA_VISIBLE_DEVICES，来决定使用哪些GPU
-# CUDA_VISIBLE_DEVICES="0,1" python -m torch.distributed.launch --nproc_per_node 2 main.py
+
+'''多卡测试(evaluation)：'''
+if local_rank == 0:
+    My_model.eval()
+    with torch.no_grad():
+        acc = My_eval(My_model)
+    torch.save(My_model.module.state_dict(), model_save_path)
+dist.barrier() # 这一句作用是：所有进程(gpu)上的代码都执行到这，才会执行该句下面的代码
+
+'''
+其它代码
+'''
